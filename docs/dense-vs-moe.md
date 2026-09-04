@@ -4,20 +4,21 @@ All the engineering in this repo went into making a 176B MoE usable on 32 GB of 
 17.8-19.6 tok/s decode at full 256k context, up from 8.2. Then the same machine ran a **27B dense**
 model at 6-bit, and beat it on every axis that matters.
 
-Both configurations use ~31 of the 32.7 GB available. Both run the full 262144 native context. The
+Both configurations use ~30 of the 32.7 GB available. Both run the full 262144 native context. The
 difference is where the weights live.
 
 | | Qwen3.8-Flash-Next 176B MoE | Qwen3.8-27B dense |
 |---|---|---|
 | quantisation | UD-Q2_K_XL (experts avg **3.05 bpw**) | UD-Q6_K (**~6.6 bpw**, near-lossless) |
 | weights | 46 GB of experts in host RAM, 23 GB LRU cache in VRAM | 22 GB, **entirely in VRAM** |
-| VRAM used | 31.0 / 32.7 GB | 31.4 / 32.7 GB |
+| VRAM used | 31.0 / 32.7 GB | 29.3 / 32.7 GB |
 | context | 262144 | 262144 |
-| **decode** | 17.8-19.6 tok/s | **20.9 tok/s** |
+| **decode** | 17.8-19.6 tok/s | **21.0 tok/s** |
 | **prefill, 957-token prompt** | 18.2 tok/s | **~430 tok/s** |
-| **prefill, 3722-token prompt** | 17.4 tok/s | **429 tok/s** |
+| **prefill, 3722-token prompt** | 17.4 tok/s | **431 tok/s** |
 | **prefill, 14834-token prompt** | ~18 tok/s (about 13.7 min) | **403 tok/s (36.8 s)** |
 | time to first token | 1.7-2.2 s | **0.41-0.51 s** |
+| vision | not available in this GGUF | **yes**, +889 MiB |
 | quality, 8 mixed prompts | no measurable advantage | equal or better on 2 of 8 |
 
 **24x on prefill.** That is the whole story.
@@ -63,19 +64,42 @@ the giant MoE it was bought for.
 ```
 llama-server -m Qwen3.8-27B-UD-Q6_K.gguf \
   -dev Vulkan1,Vulkan2 -sm layer -ngl 99 -ts 52,48 \
-  -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 512 -b 2048 \
+  -fa on -c 262144 -ctk q5_1 -ctv q5_1 -ub 512 -b 2048 \
+  --mmproj mmproj-F16.gguf \
   -t 8 -np 1 --jinja --reasoning off
 ```
 
-`-ts 52,48` matters at this fill level. With the default split the two cards land at 14,866 and
-16,153 MiB — the second card sits at 98.7 % and a long request tips it into host memory, which
-halves throughput silently. Rebalancing gives 15,604 / 15,772 MiB with identical speed and real
-headroom.
+At 262144 context the machine is nearly full, so every extra feature competes for the same
+1-3 GB. Measured, all at full context, VRAM read from the Windows GPU counters while serving:
 
-Speculative decoding (MTP) is worth +36 % decode (21 -> 28.5 tok/s) but the draft head plus its own
-KV cache does not fit at 256k: measured 31,969 MiB with the cards at 98.9 %, spilling to 3.3 tok/s.
-It was tested at three different tensor splits and with a q4_0 draft KV cache; none fit. At 64k it
-fits comfortably, so that is kept as a second profile.
+| config | VRAM (of 32,736 MiB) | decode | prefill @3722 | vision |
+|---|---|---|---|---|
+| KV q8_0, no MTP | 31,376 | 20.9 | 429 | no |
+| **KV q5_1 + vision (deployed)** | **29,338** | **21.0** | **431** | **yes** |
+| KV q5_1 + MTP | 30,433 | 26.7 | 208 | no |
+| KV q4_0 + MTP | 29,915 | 26.7 | — | no |
+| KV q5_1 + vision + MTP | 32,429 (**99.8 %/card**) | 26.8 | **53** | yes |
+
+Three things fall out of that table:
+
+- **Quantising the KV cache is free here.** q8_0 to q5_1 changes neither decode (20.9 to 21.0) nor
+  prefill (429 to 431), and releases 2.9 GB. Output hashes on a fixed greedy set were unchanged.
+  That 2.9 GB is the budget everything else is paid from.
+- **Vision costs 889 MiB and nothing else** — until you use it. Prefill is 431 tok/s on a fresh
+  process and **drops to 305 after the first image is processed** (measured before/after in the same
+  process), recovering on restart. Still an order of magnitude above the MoE either way.
+- **Speculative decoding trades prefill for decode**, roughly +28 % decode for -52 % prefill, because
+  the draft head has to run over the prompt too and the target context gets checkpointed. On a
+  machine where prefill was the whole reason the dense model won, that is a bad trade, so MTP is
+  kept as a separate 64k profile rather than the default.
+
+`-ts 52,48` matters at this fill level. With the default split the two cards land at 14,866 and
+16,153 MiB — the second card sits at 98.7 %, because it carries the output tensors (and the draft
+head, when present). A long request tips it into host memory, which halves throughput **silently**.
+Rebalancing gives even cards with identical speed and real headroom.
+
+256k + MTP does not fit at all: 31,969 MiB with cards at 98.9 %, decode collapsing to 3.3 tok/s.
+Tested at three tensor splits and with a q4_0 draft KV cache.
 
 ## How VRAM was actually measured
 
